@@ -1,8 +1,6 @@
 name: Migration Test Harness
 
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
     inputs:
       versions:

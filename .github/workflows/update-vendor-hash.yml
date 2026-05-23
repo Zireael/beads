@@ -34,11 +34,7 @@ name: Update vendorHash for dependabot Go bumps
 #   success acts as the green signal that the hash is correct.
 
 on:
-  pull_request_target:
-    branches: [main]
-    paths:
-      - 'go.mod'
-      - 'go.sum'
+  workflow_dispatch:
 
 permissions:
   contents: write
