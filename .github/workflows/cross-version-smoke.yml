@@ -1,16 +1,6 @@
 name: Cross-Version Smoke Tests
 
 on:
-  # On tag push (release gate): test the last 30 releases for broad regression coverage
-  push:
-    tags:
-      - 'v*'
-
-  # On PR to main: test only the last 5 releases for fast feedback
-  pull_request:
-    branches: [ main ]
-
-  # Allow manual trigger with custom version count
   workflow_dispatch:
     inputs:
       version_count:

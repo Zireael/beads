@@ -1,11 +1,6 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
-  # Manual dispatch is only for rerunning a release from a v* tag. Publishing
-  # jobs below are tag-gated and skip branch refs.
   workflow_dispatch:
 
 concurrency:
