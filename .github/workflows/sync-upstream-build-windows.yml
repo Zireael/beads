@@ -1,0 +1,48 @@
+name: Sync Upstream & Build Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sync-and-build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "Sync Bot"
+          git config --global user.email "sync@zireael.github"
+
+      - name: Sync from upstream
+        run: |
+          git remote add upstream https://github.com/gastownhall/beads.git
+          git fetch upstream
+          git checkout master
+          git merge upstream/main --no-edit
+          git push origin master
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build Windows binary
+        env:
+          CGO_ENABLED: "1"
+        run: go build -v -tags gms_pure_go -o bd.exe ./cmd/bd
+
+      - name: Smoke test
+        run: |
+          .\bd.exe version
+          .\bd.exe help
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: beads-windows-amd64
+          path: bd.exe
+          retention-days: 2
