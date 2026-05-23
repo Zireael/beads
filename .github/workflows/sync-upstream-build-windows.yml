@@ -21,9 +21,9 @@ jobs:
         run: |
           git remote add upstream https://github.com/gastownhall/beads.git
           git fetch upstream
-          git checkout master
+          git checkout main
           git merge upstream/main --no-edit
-          git push origin master
+          git push origin main
 
       - name: Set up Go
         uses: actions/setup-go@v5
