@@ -3,6 +3,9 @@ name: Sync Upstream & Build Windows
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   sync-and-build:
     runs-on: windows-latest
