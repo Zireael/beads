@@ -1,0 +1,299 @@
+# Manual test runner. Pick a suite and a ref, press Run.
+#
+# WHY THIS IS SEPARATE FROM pr.yml/bazel.yml: those are the push/PR gates, wired
+# to rbe-west remote execution and a ci-gate that requires every lane to have
+# reported. They are not something you trigger by hand to answer a question
+# about one branch. This file is for the opposite case — run one specific tier
+# against one specific ref on demand and read the log.
+#
+# THE SUITES ARE THE LANES THIS FORK ACTUALLY EXERCISED, each named after what
+# it runs rather than after a Make target, so a red job says which tier broke:
+#
+#   static   gofmt + go vet, whole tree. Minutes, no CGO.
+#   unit     go test -short ./... — the inner-loop lane.
+#   storage  dolt, embeddeddolt, uow, domain/db, conformance, issueops.
+#   served   internal/httpclient — the HTTP served-surface conformance tier.
+#   cmd-bd   cmd/bd — the embedded CLI tier; the heaviest of these.
+#   full     scripts/test.sh, the whole tree with the canonical build flags.
+#
+# NOT HERE: the Bazel CI lane (`make test` / `bazel test //... --config=ci`).
+# It is .github/workflows/bazel.yml's job, it expects the rbe-west config and
+# the pr.yml ci-gate contract, and duplicating a stripped-down copy in this file
+# would produce a workflow that looks like the CI lane but is not it.
+#
+# Exit status discipline: no step pipes the test command through grep or tail.
+# The command's own status is what fails the job, so a filtered log can never
+# report green over a red run.
+
+name: Manual Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Test tier to run'
+        type: choice
+        required: true
+        default: 'static'
+        options:
+          - static
+          - unit
+          - storage
+          - served
+          - cmd-bd
+          - full
+      ref:
+        description: 'Git ref to test (branch, tag or SHA). Leave empty to use the ref this run was started from.'
+        required: false
+        default: ''
+
+concurrency:
+  group: manual-tests-${{ inputs.suite }}-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BD_DISABLE_METRICS: "1"
+  BD_DISABLE_EVENT_FLUSH: "1"
+  # Every cgo tier below reads this to un-skip its embedded-Dolt cases; without
+  # it those tests skip themselves and the run reports green over silence.
+  BEADS_TEST_EMBEDDED_DOLT: "1"
+  BEADS_TEST_IGNORE_REPO_CONFIG: "1"
+
+jobs:
+  static:
+    name: static (gofmt + go vet)
+    if: ${{ inputs.suite == 'static' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: gofmt must report no files
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$out"
+            exit 1
+          fi
+          echo "gofmt clean"
+
+      - name: go vet ./...
+        shell: bash
+        run: |
+          set -euo pipefail
+          go vet ./...
+
+  unit:
+    name: unit (go test -short)
+    if: ${{ inputs.suite == 'unit' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Install the C toolchain and ICU headers
+        # go-icu-regex links against libicu unless gms_pure_go is in play, and a
+        # missing header here shows up as an opaque link error rather than a
+        # clear "package not installed".
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc libicu-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go test -short ./...
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          go test -short -count=1 ./...
+
+  storage:
+    name: storage tiers
+    if: ${{ inputs.suite == 'storage' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Install the C toolchain and ICU headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc libicu-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go vet (storage packages)
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          go vet ./internal/storage/... ./backend/conformance/
+
+      - name: go test (storage tiers)
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          go test -count=1 -timeout 45m \
+            ./internal/storage/issueops \
+            ./internal/storage/domain/db \
+            ./internal/storage/uow \
+            ./internal/storage/dolt \
+            ./internal/storage/embeddeddolt \
+            ./backend/conformance
+
+  served:
+    name: served HTTP tier
+    if: ${{ inputs.suite == 'served' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Install the C toolchain and ICU headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc libicu-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go vet ./internal/httpclient
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          go vet ./internal/httpclient
+
+      - name: go test ./internal/httpclient
+        # The served-surface conformance tier. ~9 minutes; its cases boot an
+        # in-process server per fixture, so this is the slowest suite here
+        # relative to the amount of code it covers.
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          BEADS_HTTP_TEST_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          go test -count=1 -timeout 45m ./internal/httpclient
+
+  cmd-bd:
+    name: cmd/bd embedded tier
+    if: ${{ inputs.suite == 'cmd-bd' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Install the C toolchain, ICU headers and git identity
+        # The tier shells out to `git config --global` in cases that assert
+        # hook installation, so a runner with no identity fails those for a
+        # reason unrelated to the code under test.
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc libicu-dev git
+          git config --global user.name "bd-ci"
+          git config --global user.email "bd-ci@localhost"
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go test ./cmd/bd
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          go test -count=1 -timeout 60m ./cmd/bd
+
+  full:
+    name: full (scripts/test.sh)
+    if: ${{ inputs.suite == 'full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Install the C toolchain and ICU headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc libicu-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: scripts/test.sh
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          ./scripts/test.sh
