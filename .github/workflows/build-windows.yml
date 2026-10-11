@@ -1,0 +1,152 @@
+# Manual Windows build of `bd.exe`.
+#
+# Why this file exists: .goreleaser.yml cross-builds only linux and android
+# (darwin is covered by release.yml's dedicated macOS job), so a Windows binary
+# was never produced anywhere in CI. This workflow is the manual way to get one.
+#
+# MANUAL ONLY (workflow_dispatch): it builds the ref you pick, it is not part
+# of any PR gate, and it publishes nothing. The artifact it uploads is an
+# unsigned developer build for local testing — there is deliberately no
+# codesign/signtool step here.
+#
+# CGO IS REQUIRED, not optional: without it the binary reports CGO_ENABLED=0
+# and the embedded Dolt store silently disappears, leaving a `bd` that cannot
+# open a database. The build therefore fails loudly if no C toolchain is on the
+# runner instead of quietly producing a non-CGO binary, and the step after the
+# build re-reads the linked build info to prove CGO was actually on.
+#
+# amd64 only: cross-compiling CGO for windows/arm64 needs a cross toolchain the
+# hosted runner does not ship, so arm64 is out of scope rather than silently
+# mis-built.
+
+name: Build Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (branch, tag or SHA). Leave empty to build the ref this run was started from.'
+        required: false
+        default: ''
+      version:
+        description: 'Version string stamped into the binary'
+        required: false
+        default: 'dev'
+      smoke_test:
+        description: 'Run an init/create/list smoke test against the built binary'
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: build-windows-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BD_DISABLE_METRICS: "1"
+  BD_DISABLE_EVENT_FLUSH: "1"
+
+jobs:
+  windows-amd64:
+    name: Windows amd64 (embedded Dolt)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          # Full history: main.Branch and main.Build are stamped from git below,
+          # and a shallow checkout makes them empty.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Require a C toolchain
+        # Fails the run rather than falling back to CGO_ENABLED=0: a binary that
+        # links without CGO builds fine and then cannot open a database, which
+        # is a much worse thing to hand someone than a red job.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v gcc >/dev/null 2>&1; then
+            echo "::error::gcc not found on the runner; a CGO build of bd is impossible, refusing to produce a non-CGO binary."
+            echo "Hosted windows runners normally ship MinGW on PATH. If this image changed, install it (choco install mingw) rather than disabling CGO."
+            exit 1
+          fi
+          echo "C toolchain:"
+          gcc --version | head -1
+
+      - name: Stamp build info
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "branch=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build bd.exe
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          go build -tags "gms_pure_go netgo" \
+            -ldflags "-s -w -X main.Version=${{ inputs.version || 'dev' }} -X main.Build=${{ steps.meta.outputs.short }} -X main.Commit=${{ steps.meta.outputs.commit }} -X main.Branch=${{ steps.meta.outputs.branch }}" \
+            -o bd.exe ./cmd/bd
+          ls -la bd.exe
+
+      - name: Verify CGO was linked in
+        # `go version -m` reads the build info out of the binary itself, so this
+        # needs no binutils (`strings`) that a Windows image may not have — the
+        # point is that the check cannot be skipped by a missing tool.
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "--- embedded build settings ---"
+          go version -m bd.exe | sed -n '/build\s/p' || true
+          if go version -m bd.exe | grep -qE '^\s+build\s+CGO_ENABLED=0$'; then
+            echo "::error::bd.exe was linked with CGO_ENABLED=0; the embedded Dolt store would be missing."
+            exit 1
+          fi
+          if ! go version -m bd.exe | grep -qE '^\s+build\s+CGO_ENABLED=1$'; then
+            echo "::error::could not confirm CGO_ENABLED=1 in bd.exe build info."
+            exit 1
+          fi
+          echo "CGO_ENABLED=1 confirmed."
+
+      - name: Report version
+        shell: bash
+        run: ./bd.exe version || ./bd.exe --version || true
+
+      - name: Smoke test embedded Dolt
+        if: ${{ inputs.smoke_test }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bd="$PWD/bd.exe"
+          tmp="$(mktemp -d)"
+          cd "$tmp"
+          git init -q -b main
+          git config user.name "CI"
+          git config user.email "ci@test"
+          git commit -q --allow-empty -m init
+          "$bd" init --non-interactive --prefix smoke
+          "$bd" create "windows smoke test" --type task
+          "$bd" list | grep -q "windows smoke test"
+          echo "smoke test ok"
+
+      - name: Upload bd.exe
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ inputs.ref && format('bd-windows-amd64-{0}', inputs.ref) || 'bd-windows-amd64' }}
+          path: bd.exe
+          if-no-files-found: error
