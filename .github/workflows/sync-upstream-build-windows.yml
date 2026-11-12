@@ -77,9 +77,15 @@ jobs:
           git push origin "HEAD:refs/heads/${{ inputs.ref }}"
 
       - name: Set up Go
+        # cache: true matches build-windows.yml. It is not just speed: the cgo
+        # objects (gozstd) are rebuilt from scratch without it, and their
+        # output embeds the temporary cgo work directory, which makes the
+        # binary differ from the manual build's by ~44 KB despite identical
+        # flags and stamps.
         uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
+          cache: true
 
       - name: Require a C toolchain
         # Same rule as build-windows.yml: refuse to fall back to CGO_ENABLED=0,
