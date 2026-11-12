@@ -29,6 +29,10 @@ on:
         description: 'Upstream branch to merge in'
         required: true
         default: 'main'
+      version:
+        description: 'Version string stamped into the binary'
+        required: false
+        default: 'dev'
       smoke_test:
         description: 'Run a version/help smoke test against bd.exe'
         type: boolean
@@ -89,17 +93,30 @@ jobs:
           fi
           gcc --version | head -1
 
+      - name: Stamp build info
+        # Identical stamps to build-windows.yml, derived the same way, so the
+        # two workflows build the same commit into the same binary.
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "branch=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
       - name: Build Windows binary (unsigned)
         shell: bash
         env:
           CGO_ENABLED: "1"
         run: |
           set -euo pipefail
-          # -s -w matches build-windows.yml: strip the symbol table and DWARF
-          # so the developer artifact is ~half the size. Nothing downstream
-          # needs symbols: the CGO check reads go's build info, and the
-          # signature check reads the PE, both of which survive stripping.
-          go build -v -tags gms_pure_go -ldflags "-s -w" -o bd.exe ./cmd/bd
+          # Flags, tags and stamps match build-windows.yml exactly: -s -w strips
+          # the symbol table and DWARF (the CGO check reads go's build info and
+          # the signature check reads the PE, both of which survive stripping),
+          # and the -X stamps are what make the two artifacts comparable.
+          go build -v -tags "gms_pure_go netgo" \
+            -ldflags "-s -w -X main.Version=${{ inputs.version || 'dev' }} -X main.Build=${{ steps.meta.outputs.short }} -X main.Commit=${{ steps.meta.outputs.commit }} -X main.Branch=${{ steps.meta.outputs.branch }}" \
+            -o bd.exe ./cmd/bd
           ls -la bd.exe
 
       - name: Assert the binary is unsigned
