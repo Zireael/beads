@@ -62,7 +62,7 @@ env:
 
 jobs:
   sync-and-build:
-    name: Sync ${{ inputs.ref }} and build bd.exe (unsigned)
+    name: Sync ${{ inputs.ref }} and build bd.exe (unsigned)${{ inputs.push && '' || ' - no push' }}
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -78,31 +78,75 @@ jobs:
           git config --global user.email "sync@zireael.github"
 
       - name: Sync from upstream
+        id: sync
         # The merge always happens in this checkout, so the artifact is built
-        # from synced source either way. Only the push is gated: without it
-        # the branch on the remote is exactly as it was when the run started.
+        # from synced source either way. Only the push is gated: without it the
+        # branch on the remote is exactly as it was when the run started, which
+        # means the built commit can exist nowhere but this runner. That case is
+        # warned about, named in the artifact, and recorded in the summary, so
+        # the artifact is never mistaken for a branch build.
         shell: bash
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/gastownhall/beads.git 2>/dev/null || true
           git fetch upstream "${{ inputs.upstream_ref }}"
-          before=$(git rev-parse HEAD)
+
+          # The branch head as the remote has it right now. Empty when `ref` is
+          # not a branch (tag or SHA), where the comparison is meaningless.
+          branch_head=""
+          if git fetch --quiet origin "+refs/heads/${{ inputs.ref }}:refs/remotes/origin/${{ inputs.ref }}"; then
+            branch_head=$(git rev-parse "refs/remotes/origin/${{ inputs.ref }}")
+          fi
+
           git merge "upstream/${{ inputs.upstream_ref }}" --no-edit
-          echo "HEAD before merge: $before"
-          echo "HEAD after merge:  $(git rev-parse HEAD)"
+          built=$(git rev-parse HEAD)
+          built_short=$(git rev-parse --short HEAD)
+
+          off_branch=false
+          if [ -n "$branch_head" ] && [ "$built" != "$branch_head" ]; then
+            off_branch=true
+          fi
+          if [ "${{ inputs.push }}" = "true" ] || [ "$off_branch" = false ]; then
+            is_branch_build=yes
+          else
+            is_branch_build=no
+          fi
+
+          {
+            echo "built=$built"
+            echo "built_short=$built_short"
+            echo "branch_head=$branch_head"
+            echo "off_branch=$off_branch"
+            echo "is_branch_build=$is_branch_build"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Built commit: $built"
+          echo "Branch head:  ${branch_head:-<unknown: ${{ inputs.ref }} is not a branch>}"
+
           if [ "${{ inputs.push }}" = "true" ]; then
             git push origin "HEAD:refs/heads/${{ inputs.ref }}"
             echo "::notice::Pushed the merge to ${{ inputs.ref }}; its CI will restart."
+          elif [ "$off_branch" = true ]; then
+            echo "::warning::Built ${built_short}, which is NOT on ${{ inputs.ref }} (branch head is $(git rev-parse --short "$branch_head")). push is off, so this is a local-only merge: the artifact is not a branch build."
           else
             echo "::notice::push is off: built the merge locally, ${{ inputs.ref }} on the remote is untouched."
           fi
+
           {
             echo "### Sync"
-            echo "- target: \`${{ inputs.ref }}\`"
-            echo "- upstream: \`${{ inputs.upstream_ref }}\`"
-            echo "- head before: \`$before\`"
-            echo "- head built: \`$(git rev-parse HEAD)\`"
-            echo "- pushed: ${{ inputs.push }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| target branch | \`${{ inputs.ref }}\` |"
+            echo "| upstream | \`${{ inputs.upstream_ref }}\` |"
+            echo "| branch head (remote) | \`${branch_head:-unknown}\` |"
+            echo "| **built commit** | **\`$built\`** |"
+            echo "| pushed | ${{ inputs.push }} |"
+            echo "| artifact is a branch build | **$is_branch_build** |"
+            echo ""
+            if [ "$is_branch_build" = no ]; then
+              echo "> **Warning:** this build is a local-only merge. \`${built_short}\` does not exist on \`${{ inputs.ref }}\` (which is at \`${branch_head:0:9}\`)."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Go
@@ -186,6 +230,8 @@ jobs:
       - name: Upload bd.exe
         uses: actions/upload-artifact@v4
         with:
-          name: bd-windows-amd64-${{ inputs.ref }}
+          # The `-unpushed-<sha>` suffix is how a local-only merge announces
+          # itself in the artifact list; a branch build keeps the plain name.
+          name: bd-windows-amd64-${{ inputs.ref }}${{ steps.sync.outputs.is_branch_build == 'no' && format('-unpushed-{0}', steps.sync.outputs.built_short) || '' }}
           path: bd.exe
           retention-days: 2
