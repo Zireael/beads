@@ -17,6 +17,11 @@ name: Sync Upstream & Build Windows
 # Repeatable: every future sync is one dispatch of this workflow. `ref` picks
 # the branch to merge upstream into and build; `upstream_ref` picks what to
 # merge in.
+#
+# Pushing is OPT-IN. By default the run merges upstream into the runner's
+# checkout and builds that, leaving the branch on the remote alone, so a build
+# can never move a PR head, restart its CI or stale its review. Set `push` to
+# true when you do want the merge written back.
 
 on:
   workflow_dispatch:
@@ -29,6 +34,11 @@ on:
         description: 'Upstream branch to merge in'
         required: true
         default: 'main'
+      push:
+        description: 'Push the merge back to ref (moves the PR head, restarts CI)'
+        type: boolean
+        required: false
+        default: false
       version:
         description: 'Version string stamped into the binary'
         required: false
@@ -68,13 +78,32 @@ jobs:
           git config --global user.email "sync@zireael.github"
 
       - name: Sync from upstream
+        # The merge always happens in this checkout, so the artifact is built
+        # from synced source either way. Only the push is gated: without it
+        # the branch on the remote is exactly as it was when the run started.
         shell: bash
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/gastownhall/beads.git 2>/dev/null || true
           git fetch upstream "${{ inputs.upstream_ref }}"
+          before=$(git rev-parse HEAD)
           git merge "upstream/${{ inputs.upstream_ref }}" --no-edit
-          git push origin "HEAD:refs/heads/${{ inputs.ref }}"
+          echo "HEAD before merge: $before"
+          echo "HEAD after merge:  $(git rev-parse HEAD)"
+          if [ "${{ inputs.push }}" = "true" ]; then
+            git push origin "HEAD:refs/heads/${{ inputs.ref }}"
+            echo "::notice::Pushed the merge to ${{ inputs.ref }}; its CI will restart."
+          else
+            echo "::notice::push is off: built the merge locally, ${{ inputs.ref }} on the remote is untouched."
+          fi
+          {
+            echo "### Sync"
+            echo "- target: \`${{ inputs.ref }}\`"
+            echo "- upstream: \`${{ inputs.upstream_ref }}\`"
+            echo "- head before: \`$before\`"
+            echo "- head built: \`$(git rev-parse HEAD)\`"
+            echo "- pushed: ${{ inputs.push }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Go
         # cache: true matches build-windows.yml so both jobs share the module
