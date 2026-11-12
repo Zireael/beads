@@ -1,18 +1,61 @@
 name: Sync Upstream & Build Windows
 
+# Sync one of this fork's branches with gastownhall/beads and compile an
+# UNSIGNED bd.exe.
+#
+# Unsigned is the permanent, deliberate choice for this path:
+#   * `go build` emits an unsigned PE. Nothing here runs goreleaser,
+#     osslsigncode, signtool or scripts/sign-windows.sh, so there is no
+#     signing hook to satisfy.
+#   * It needs no WINDOWS_SIGNING_CERT_PFX_BASE64 / WINDOWS_SIGNING_CERT_PASSWORD
+#     secrets, so a sync can never block on a certificate that only exists for
+#     a real release.
+#   * The `Assert the binary is unsigned` step enforces it: the run fails if a
+#     signature ever appears, so this cannot quietly change later. Signing
+#     stays in gastownhall/beads' release.yml, which is guard-skipped in forks.
+#
+# Repeatable: every future sync is one dispatch of this workflow. `ref` picks
+# the branch to merge upstream into and build; `upstream_ref` picks what to
+# merge in.
+
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Fork branch to sync and build'
+        required: true
+        default: 'main'
+      upstream_ref:
+        description: 'Upstream branch to merge in'
+        required: true
+        default: 'main'
+      smoke_test:
+        description: 'Run a version/help smoke test against bd.exe'
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: write
 
+concurrency:
+  group: sync-upstream-build-windows-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  BD_DISABLE_METRICS: "1"
+  BD_DISABLE_EVENT_FLUSH: "1"
+
 jobs:
   sync-and-build:
+    name: Sync ${{ inputs.ref }} and build bd.exe (unsigned)
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout (full history)
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
 
       - name: Configure Git
@@ -21,31 +64,73 @@ jobs:
           git config --global user.email "sync@zireael.github"
 
       - name: Sync from upstream
+        shell: bash
         run: |
-          git remote add upstream https://github.com/gastownhall/beads.git
-          git fetch upstream
-          git checkout main
-          git merge upstream/main --no-edit
-          git push origin main
+          set -euo pipefail
+          git remote add upstream https://github.com/gastownhall/beads.git 2>/dev/null || true
+          git fetch upstream "${{ inputs.upstream_ref }}"
+          git merge "upstream/${{ inputs.upstream_ref }}" --no-edit
+          git push origin "HEAD:refs/heads/${{ inputs.ref }}"
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
 
-      - name: Build Windows binary
+      - name: Require a C toolchain
+        # Same rule as build-windows.yml: refuse to fall back to CGO_ENABLED=0,
+        # because that binary builds fine and then cannot open a database.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v gcc >/dev/null 2>&1; then
+            echo "::error::gcc not found; refusing to produce a non-CGO binary."
+            exit 1
+          fi
+          gcc --version | head -1
+
+      - name: Build Windows binary (unsigned)
+        shell: bash
         env:
           CGO_ENABLED: "1"
-        run: go build -v -tags gms_pure_go -o bd.exe ./cmd/bd
+        run: |
+          set -euo pipefail
+          go build -v -tags gms_pure_go -o bd.exe ./cmd/bd
+          ls -la bd.exe
+
+      - name: Assert the binary is unsigned
+        # The enforcement half of the policy above: an unsigned PE is the
+        # contract of this workflow, so a signature showing up is a failure,
+        # not a bonus.
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature .\bd.exe
+          Write-Host "Authenticode status: $($sig.Status)"
+          if ($sig.Status -ne 'NotSigned') {
+            throw "bd.exe is signed ($($sig.Status)); this workflow builds unsigned binaries only."
+          }
+
+      - name: Verify CGO was linked in
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version -m bd.exe | sed -n '/build\s/p' || true
+          if ! go version -m bd.exe | grep -qE '^\s+build\s+CGO_ENABLED=1$'; then
+            echo "::error::bd.exe was not linked with CGO_ENABLED=1; the embedded Dolt store would be missing."
+            exit 1
+          fi
 
       - name: Smoke test
+        if: ${{ inputs.smoke_test }}
+        shell: bash
         run: |
-          .\bd.exe version
-          .\bd.exe help
+          set -euo pipefail
+          ./bd.exe version
+          ./bd.exe help
 
-      - name: Upload artifact
+      - name: Upload bd.exe
         uses: actions/upload-artifact@v4
         with:
-          name: beads-windows-amd64
+          name: bd-windows-amd64-${{ inputs.ref }}
           path: bd.exe
           retention-days: 2
