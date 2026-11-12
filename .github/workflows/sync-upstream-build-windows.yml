@@ -95,7 +95,11 @@ jobs:
           CGO_ENABLED: "1"
         run: |
           set -euo pipefail
-          go build -v -tags gms_pure_go -o bd.exe ./cmd/bd
+          # -s -w matches build-windows.yml: strip the symbol table and DWARF
+          # so the developer artifact is ~half the size. Nothing downstream
+          # needs symbols: the CGO check reads go's build info, and the
+          # signature check reads the PE, both of which survive stripping.
+          go build -v -tags gms_pure_go -ldflags "-s -w" -o bd.exe ./cmd/bd
           ls -la bd.exe
 
       - name: Assert the binary is unsigned
